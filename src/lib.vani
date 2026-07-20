@@ -1,0 +1,370 @@
+// vani-algebra  v0.1.0 — polynomial root-finding and nonlinear equation systems
+//
+// IMPORTANT — do NOT reimplement vāṇी compiler builtins.
+// Already available as builtins (call directly, never redeclare here):
+//   sin cos sqrt abs acos exp  f64_pi()  f64_cbrt  f64_quadratic_root
+//   push pop len set vec
+//
+// Depends on vani-matrix (mat_zeros, mat_eig_power, mat_solve) for the
+// companion-matrix eigenvalue method and the linear-system solves inside
+// Newton's method, and on vani-calculus (poly_eval, poly_deriv_coeffs,
+// poly_mul) for polynomial evaluation/differentiation/construction --
+// see [deps] in vani.toml. Pure linear systems don't get a wrapper here:
+// call vani-matrix's mat_solve directly, there is nothing for this
+// package to add on top.
+//
+// ENCODING: polynomial coefficients are ascending Vec<f64>, matching
+// vani-calculus's poly_eval/poly_deriv_coeffs/poly_mul convention exactly
+// (coeffs[0] is the constant term, coeffs[k] is the x^k coefficient) --
+// NOT vani-matrix's row-major-matrix convention, since these are the
+// functions this package composes with most.
+//
+// SCOPE DECISION — real roots only, not the roadmap's literal "cubic/quartic
+// closed forms" (decided up front, not left implicit):
+//   - Quadratic: not reimplemented -- the compiler builtin
+//     f64_quadratic_root already covers it (see checker.rs's builtin
+//     allowlist); this package derives the second root from it via Vieta's
+//     formulas (r1+r2 = -b/a) rather than computing the discriminant twice.
+//   - Cubic: a genuine closed form (Cardano's method: trigonometric formula
+//     when the depressed cubic has 3 real roots, the two-cube-root formula
+//     when it has 1). Real roots only -- the complex-conjugate pair in the
+//     1-real-root case is not returned (no vani-complex dependency).
+//   - Quartic and higher: NOT a hand-derived closed form (Ferrari's method
+//     for the quartic has a delicate resolvent-cubic derivation that is
+//     easy to get subtly wrong without a symbolic-math reference to check
+//     against). Instead, degree >= 4 uses ONE general method: build the
+//     companion matrix, find its dominant eigenvalue via vani-matrix's
+//     mat_eig_power (real, largest-magnitude), polish it with
+//     algebra_poly_refine_newton, deflate the polynomial by synthetic
+//     division (NOT matrix deflation -- mat_eig_deflate's A - lambda*v*v^T
+//     trick assumes a symmetric matrix with orthonormal eigenvectors,
+//     which a companion matrix is not; using it here would silently
+//     corrupt every root after the first), and repeat until the remaining
+//     degree is <= 3, then finish with the cubic/quadratic/linear closed
+//     forms. algebra_quartic_roots_real is a thin wrapper over this same
+//     general path, not a separate Ferrari implementation, so quartic and
+//     quintic-plus share one well-tested code path.
+//   - This whole package only finds REAL roots. mat_eig_power's power
+//     iteration converges to a real dominant eigenvalue; it has no
+//     mechanism to detect or return complex-conjugate eigenvalue pairs
+//     (see vani-matrix's own mat_cond docs, which carry the same caveat).
+//     A polynomial whose remaining factor at some deflation step is
+//     dominated by a complex-conjugate pair will not have that pair
+//     detected -- callers needing complex roots need a different tool.
+use "../vendor/matrix/src/lib.vani";
+use "../vendor/calculus/src/lib.vani";
+
+// Private helper: vani-calculus's poly_eval/poly_deriv_coeffs/poly_mul take
+// Vec<f64> by value (not ref), consuming their argument -- this copies a
+// ref back into an owned Vec so the original stays usable after the call.
+#[bounded_stack(bytes = 112)]
+fn _copy_f64(x: ref Vec<f64>) -> Vec<f64> {
+    let n: i64 = len(x) as i64;
+    let out: Vec<f64> = vec();
+    let i: i64 = 0;
+    while i < n {
+        push(mut ref out, x[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Polynomial construction and companion-matrix machinery ──────────────────
+
+// Product of (x - roots[i]) over every root, via repeated vani-calculus
+// poly_mul calls -- the inverse operation of root-finding, handy for
+// constructing test polynomials with known roots.
+#[bounded_stack(bytes = 384)]
+fn algebra_poly_from_roots(roots: ref Vec<f64>) -> Vec<f64> {
+    let n: i64 = len(roots) as i64;
+    let out: Vec<f64> = vec(1.0);
+    let i: i64 = 0;
+    while i < n {
+        let factor: Vec<f64> = vec();
+        push(mut ref factor, 0.0 - roots[i]);
+        push(mut ref factor, 1.0);
+        out = poly_mul(out, factor);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Divide every coefficient by the leading one, so the polynomial becomes
+// monic (leading coefficient 1) -- companion matrices are only defined for
+// monic polynomials.
+#[bounded_stack(bytes = 120)]
+fn algebra_poly_normalize_monic(coeffs: ref Vec<f64>) -> Vec<f64> {
+    let n: i64 = len(coeffs) as i64;
+    let lead: f64 = coeffs[n - 1];
+    let out: Vec<f64> = vec();
+    let i: i64 = 0;
+    while i < n {
+        push(mut ref out, coeffs[i] / lead);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Companion matrix of a degree-n polynomial (n x n, row-major): its
+// eigenvalues are exactly the polynomial's roots. Standard "bottom
+// companion" form -- subdiagonal ones, last column holds the negated
+// (monic-normalized) coefficients.
+#[bounded_stack(bytes = 272)]
+fn algebra_poly_companion(coeffs: ref Vec<f64>) -> Vec<f64> {
+    let monic: Vec<f64> = algebra_poly_normalize_monic(coeffs);
+    let n: i64 = (len(ref monic) as i64) - 1;
+    let C: Vec<f64> = mat_zeros(n, n);
+    let i: i64 = 1;
+    while i < n {
+        set(mut ref C, i * n + (i - 1), 1.0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        set(mut ref C, i * n + (n - 1), 0.0 - monic[i]);
+        i = i + 1;
+    }
+    return C;
+}
+
+// Synthetic division: given p(x) and a known root r, returns the quotient
+// q(x) = p(x) / (x - r), one degree shorter. This is polynomial deflation,
+// not matrix deflation -- see the file header for why mat_eig_deflate is
+// NOT used here.
+#[bounded_stack(bytes = 144)]
+fn algebra_poly_deflate(coeffs: ref Vec<f64>, r: f64) -> Vec<f64> {
+    let n: i64 = len(coeffs) as i64;
+    let deg: i64 = n - 1;
+    let q: Vec<f64> = vec();
+    let i: i64 = 0;
+    while i < deg {
+        push(mut ref q, 0.0);
+        i = i + 1;
+    }
+    set(mut ref q, deg - 1, coeffs[deg]);
+    let k: i64 = deg - 2;
+    while k >= 0 {
+        set(mut ref q, k, coeffs[k + 1] + r * q[k + 1]);
+        k = k - 1;
+    }
+    return q;
+}
+
+// Polishes a candidate real root with plain Newton's method on p and p'
+// (vani-calculus's poly_eval / poly_deriv_coeffs), improving accuracy on
+// an estimate from e.g. the companion-matrix eigenvalue method.
+#[bounded_stack(bytes = 344)]
+fn algebra_poly_refine_newton(coeffs: ref Vec<f64>, x0: f64, iters: i64) -> f64 {
+    let x: f64 = x0;
+    let i: i64 = 0;
+    while i < iters {
+        let c1: Vec<f64> = _copy_f64(coeffs);
+        let fx: f64 = poly_eval(c1, x);
+        let c2: Vec<f64> = _copy_f64(coeffs);
+        let dcoeffs: Vec<f64> = poly_deriv_coeffs(c2);
+        let fpx: f64 = poly_eval(dcoeffs, x);
+        if abs(fpx) < 1.0e-300 {
+            return x;
+        }
+        x = x - fx / fpx;
+        i = i + 1;
+    }
+    return x;
+}
+
+// ── Cubic (closed form) ──────────────────────────────────────────────────────
+
+// Real roots of a*x^3 + b*x^2 + c*x + d = 0 via Cardano's method: 1 real
+// root (Cardano's two-cube-root formula) or 3 real roots (trigonometric
+// formula, avoiding complex arithmetic entirely). See the file header for
+// why this is a true closed form while quartic-and-up is not.
+#[bounded_stack(bytes = 296)]
+fn algebra_cubic_roots_real(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
+    let p: f64 = (3.0 * a * c - b * b) / (3.0 * a * a);
+    let q: f64 = (2.0 * b * b * b - 9.0 * a * b * c + 27.0 * a * a * d) / (27.0 * a * a * a);
+    let offset: f64 = (0.0 - b) / (3.0 * a);
+    let out: Vec<f64> = vec();
+
+    if abs(p) < 1.0e-12 {
+        let t: f64 = f64_cbrt(0.0 - q);
+        push(mut ref out, t + offset);
+        return out;
+    }
+
+    let disc: f64 = (0.0 - 4.0) * p * p * p - 27.0 * q * q;
+    if disc >= 0.0 {
+        let pi: f64 = f64_pi();
+        let inner: f64 = (3.0 * q) / (2.0 * p) * sqrt((0.0 - 3.0) / p);
+        if inner > 1.0 {
+            inner = 1.0;
+        }
+        if inner < 0.0 - 1.0 {
+            inner = 0.0 - 1.0;
+        }
+        let theta: f64 = acos(inner);
+        let amp: f64 = 2.0 * sqrt((0.0 - p) / 3.0);
+        let k: i64 = 0;
+        while k < 3 {
+            let tk: f64 = amp * cos(theta / 3.0 - 2.0 * pi * (k as f64) / 3.0);
+            push(mut ref out, tk + offset);
+            k = k + 1;
+        }
+        return out;
+    }
+
+    let inner_sqrt: f64 = sqrt(q * q / 4.0 + p * p * p / 27.0);
+    let u: f64 = f64_cbrt((0.0 - q) / 2.0 + inner_sqrt);
+    let v: f64 = f64_cbrt((0.0 - q) / 2.0 - inner_sqrt);
+    push(mut ref out, u + v + offset);
+    return out;
+}
+
+// ── General real-root finder (any degree) ────────────────────────────────────
+
+// All real roots of a polynomial of any degree, dispatching to the cheapest
+// exact method available: linear/quadratic direct formulas, the cubic
+// closed form above, or (degree >= 4) the companion-matrix + synthetic-
+// deflation loop described in the file header. Real roots only.
+#[bounded_stack(bytes = 928)]
+fn algebra_poly_roots_real(coeffs: ref Vec<f64>) -> Vec<f64> {
+    let deg: i64 = (len(coeffs) as i64) - 1;
+    let out: Vec<f64> = vec();
+    if deg <= 0 {
+        return out;
+    }
+    if deg == 1 {
+        push(mut ref out, (0.0 - coeffs[0]) / coeffs[1]);
+        return out;
+    }
+    if deg == 2 {
+        let a: f64 = coeffs[2];
+        let b: f64 = coeffs[1];
+        let c: f64 = coeffs[0];
+        let r1: f64 = f64_quadratic_root(a, b, c);
+        if r1 == r1 {
+            let r2: f64 = (0.0 - b) / a - r1;
+            push(mut ref out, r1);
+            push(mut ref out, r2);
+        }
+        return out;
+    }
+    if deg == 3 {
+        return algebra_cubic_roots_real(coeffs[3], coeffs[2], coeffs[1], coeffs[0]);
+    }
+
+    let cur: Vec<f64> = _copy_f64(coeffs);
+    let cur_deg: i64 = deg;
+    while cur_deg > 3 {
+        let C: Vec<f64> = algebra_poly_companion(ref cur);
+        let eig: Vec<f64> = mat_eig_power(ref C, cur_deg, 500, 1.0e-10);
+        let r_raw: f64 = eig[0];
+        let cur_copy: Vec<f64> = _copy_f64(ref cur);
+        let r: f64 = algebra_poly_refine_newton(ref cur_copy, r_raw, 20);
+        push(mut ref out, r);
+        cur = algebra_poly_deflate(ref cur, r);
+        cur_deg = cur_deg - 1;
+    }
+    if cur_deg == 3 {
+        let rest: Vec<f64> = algebra_cubic_roots_real(cur[3], cur[2], cur[1], cur[0]);
+        let i: i64 = 0;
+        while i < (len(ref rest) as i64) {
+            push(mut ref out, rest[i]);
+            i = i + 1;
+        }
+    } else {
+        if cur_deg == 2 {
+            let a2: f64 = cur[2];
+            let b2: f64 = cur[1];
+            let c2: f64 = cur[0];
+            let r1b: f64 = f64_quadratic_root(a2, b2, c2);
+            if r1b == r1b {
+                let r2b: f64 = (0.0 - b2) / a2 - r1b;
+                push(mut ref out, r1b);
+                push(mut ref out, r2b);
+            }
+        } else {
+            if cur_deg == 1 {
+                push(mut ref out, (0.0 - cur[0]) / cur[1]);
+            }
+        }
+    }
+    return out;
+}
+
+// Convenience wrapper for a*x^4 + b*x^3 + c*x^2 + d*x + e = 0: builds the
+// ascending coefficient Vec and calls algebra_poly_roots_real. Not a
+// separate Ferrari's-method implementation -- see file header.
+#[bounded_stack(bytes = 1048)]
+fn algebra_quartic_roots_real(a: f64, b: f64, c: f64, d: f64, e: f64) -> Vec<f64> {
+    let coeffs: Vec<f64> = vec();
+    push(mut ref coeffs, e);
+    push(mut ref coeffs, d);
+    push(mut ref coeffs, c);
+    push(mut ref coeffs, b);
+    push(mut ref coeffs, a);
+    return algebra_poly_roots_real(ref coeffs);
+}
+
+// ── Nonlinear systems of equations ───────────────────────────────────────────
+
+// Solves F(x) = 0 for a vector-valued F via Newton-Raphson: x_{k+1} = x_k -
+// J(x_k)^-1 F(x_k), with the linear solve at each step done by vani-matrix's
+// mat_solve. F returns the length-n residual; J returns the flat n x n
+// Jacobian (row-major). Stops early once ||F(x)||_2 < tol.
+#[bounded_stack(bytes = 744)]
+fn algebra_newton_system(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n: i64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let x: Vec<f64> = _copy_f64(x0);
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let Fx: Vec<f64> = F(ref x);
+        if vec_norm2(ref Fx, n) < tol {
+            return x;
+        }
+        let Jx: Vec<f64> = J(ref x);
+        let delta: Vec<f64> = mat_solve(ref Jx, ref Fx, n);
+        let i: i64 = 0;
+        while i < n {
+            set(mut ref x, i, x[i] - delta[i]);
+            i = i + 1;
+        }
+        iter = iter + 1;
+    }
+    return x;
+}
+
+// Same as algebra_newton_system but estimates the Jacobian by forward
+// finite differences (step h) instead of requiring an analytic J --
+// matching vani-optimize's precedent of offering both an analytic and a
+// finite-difference variant of Newton's method.
+#[bounded_stack(bytes = 824)]
+fn algebra_newton_system_fd(F: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n: i64, h: f64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let x: Vec<f64> = _copy_f64(x0);
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let Fx: Vec<f64> = F(ref x);
+        if vec_norm2(ref Fx, n) < tol {
+            return x;
+        }
+        let J: Vec<f64> = mat_zeros(n, n);
+        let j: i64 = 0;
+        while j < n {
+            let xp: Vec<f64> = _copy_f64(ref x);
+            set(mut ref xp, j, xp[j] + h);
+            let Fxp: Vec<f64> = F(ref xp);
+            let r: i64 = 0;
+            while r < n {
+                set(mut ref J, r * n + j, (Fxp[r] - Fx[r]) / h);
+                r = r + 1;
+            }
+            j = j + 1;
+        }
+        let delta: Vec<f64> = mat_solve(ref J, ref Fx, n);
+        let i: i64 = 0;
+        while i < n {
+            set(mut ref x, i, x[i] - delta[i]);
+            i = i + 1;
+        }
+        iter = iter + 1;
+    }
+    return x;
+}
