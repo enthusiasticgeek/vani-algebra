@@ -53,10 +53,23 @@
 //     detected -- callers needing complex roots need a different tool.
 // No `use` statement needed: vanic auto-includes every [deps] entry's
 // source before compiling.
+//
+// WCET (MAINT-1, added 2026-07-21 -- see kosh-index/ROADMAP.md): no
+// function in this package gets a #[wcet(cycles=N)] attribute. Every one
+// of them has a `while` loop bounded by a Vec length or an iteration-count
+// parameter (`iters`/`max_iter`) -- both unbounded under `vanic check`'s
+// WCET model, same as any runtime-dependent loop elsewhere in this
+// ecosystem. (`algebra_cubic_roots_real`'s `while k < 3` is a fixed 3
+// iterations in practice, but the checker's WCET pass doesn't special-case
+// a `while` loop with a literal bound -- only `for` loops with const
+// start/end get that treatment -- so it's UNBOUNDED to the checker too;
+// not worth rewriting a working, tested loop just to satisfy the
+// estimator.) See each function's own comment for its WCET formula.
 
 // Private helper: vani-calculus's poly_eval/poly_deriv_coeffs/poly_mul take
 // Vec<f64> by value (not ref), consuming their argument -- this copies a
 // ref back into an owned Vec so the original stays usable after the call.
+// WCET = 20 + len(x) * ~10 cycles.
 #[bounded_stack(bytes = 112)]
 fn _copy_f64(x: ref Vec<f64>) -> Vec<f64> {
     let n: i64 = len(x) as i64;
@@ -74,6 +87,8 @@ fn _copy_f64(x: ref Vec<f64>) -> Vec<f64> {
 // Product of (x - roots[i]) over every root, via repeated vani-calculus
 // poly_mul calls -- the inverse operation of root-finding, handy for
 // constructing test polynomials with known roots.
+// WCET = 20 + len(roots) * (poly_mul's own O(n) cost, n growing each
+// iteration) -- O(n^2) overall in the number of roots.
 #[bounded_stack(bytes = 384)]
 fn algebra_poly_from_roots(roots: ref Vec<f64>) -> Vec<f64> {
     let n: i64 = len(roots) as i64;
@@ -91,7 +106,7 @@ fn algebra_poly_from_roots(roots: ref Vec<f64>) -> Vec<f64> {
 
 // Divide every coefficient by the leading one, so the polynomial becomes
 // monic (leading coefficient 1) -- companion matrices are only defined for
-// monic polynomials.
+// monic polynomials. WCET = 20 + len(coeffs) * ~10 cycles.
 #[bounded_stack(bytes = 120)]
 fn algebra_poly_normalize_monic(coeffs: ref Vec<f64>) -> Vec<f64> {
     let n: i64 = len(coeffs) as i64;
@@ -108,7 +123,8 @@ fn algebra_poly_normalize_monic(coeffs: ref Vec<f64>) -> Vec<f64> {
 // Companion matrix of a degree-n polynomial (n x n, row-major): its
 // eigenvalues are exactly the polynomial's roots. Standard "bottom
 // companion" form -- subdiagonal ones, last column holds the negated
-// (monic-normalized) coefficients.
+// (monic-normalized) coefficients. WCET = 20 + call
+// algebra_poly_normalize_monic + 2 * O(n) loops over the n x n matrix.
 #[bounded_stack(bytes = 272)]
 fn algebra_poly_companion(coeffs: ref Vec<f64>) -> Vec<f64> {
     let monic: Vec<f64> = algebra_poly_normalize_monic(coeffs);
@@ -130,7 +146,8 @@ fn algebra_poly_companion(coeffs: ref Vec<f64>) -> Vec<f64> {
 // Synthetic division: given p(x) and a known root r, returns the quotient
 // q(x) = p(x) / (x - r), one degree shorter. This is polynomial deflation,
 // not matrix deflation -- see the file header for why mat_eig_deflate is
-// NOT used here.
+// NOT used here. WCET = 20 + len(coeffs) * ~10 cycles (two passes, same
+// order).
 #[bounded_stack(bytes = 144)]
 fn algebra_poly_deflate(coeffs: ref Vec<f64>, r: f64) -> Vec<f64> {
     let n: i64 = len(coeffs) as i64;
@@ -153,6 +170,7 @@ fn algebra_poly_deflate(coeffs: ref Vec<f64>, r: f64) -> Vec<f64> {
 // Polishes a candidate real root with plain Newton's method on p and p'
 // (vani-calculus's poly_eval / poly_deriv_coeffs), improving accuracy on
 // an estimate from e.g. the companion-matrix eigenvalue method.
+// WCET = 20 + iters * (2 * _copy_f64 + 2 * poly_eval, each O(len(coeffs))).
 #[bounded_stack(bytes = 344)]
 fn algebra_poly_refine_newton(coeffs: ref Vec<f64>, x0: f64, iters: i64) -> f64 {
     let x: f64 = x0;
@@ -177,7 +195,10 @@ fn algebra_poly_refine_newton(coeffs: ref Vec<f64>, x0: f64, iters: i64) -> f64 
 // Real roots of a*x^3 + b*x^2 + c*x + d = 0 via Cardano's method: 1 real
 // root (Cardano's two-cube-root formula) or 3 real roots (trigonometric
 // formula, avoiding complex arithmetic entirely). See the file header for
-// why this is a true closed form while quartic-and-up is not.
+// why this is a true closed form while quartic-and-up is not. WCET: fixed
+// cost in reality (the `while k < 3` branch always runs exactly 3 times),
+// but the checker's WCET pass can't prove that for a `while` loop (only
+// `for` loops with const bounds get that treatment) -- see file header.
 #[bounded_stack(bytes = 296)]
 fn algebra_cubic_roots_real(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
     let p: f64 = (3.0 * a * c - b * b) / (3.0 * a * a);
@@ -225,6 +246,12 @@ fn algebra_cubic_roots_real(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
 // exact method available: linear/quadratic direct formulas, the cubic
 // closed form above, or (degree >= 4) the companion-matrix + synthetic-
 // deflation loop described in the file header. Real roots only.
+// WCET: dominated by the degree->3 deflation loop, each iteration calling
+// algebra_poly_companion (O(n^2)) + mat_eig_power (500 max iterations,
+// itself O(n^2) per iteration) + algebra_poly_refine_newton (20 iters) +
+// algebra_poly_deflate (O(n)) -- O(n) deflation steps of O(n^2) work each,
+// so O(n^3) overall in the polynomial's degree, plus the fixed 500/20
+// iteration caps on the two inner iterative solvers.
 #[bounded_stack(bytes = 928)]
 fn algebra_poly_roots_real(coeffs: ref Vec<f64>) -> Vec<f64> {
     let deg: i64 = (len(coeffs) as i64) - 1;
@@ -293,7 +320,8 @@ fn algebra_poly_roots_real(coeffs: ref Vec<f64>) -> Vec<f64> {
 
 // Convenience wrapper for a*x^4 + b*x^3 + c*x^2 + d*x + e = 0: builds the
 // ascending coefficient Vec and calls algebra_poly_roots_real. Not a
-// separate Ferrari's-method implementation -- see file header.
+// separate Ferrari's-method implementation -- see file header. WCET: 5
+// pushes + call algebra_poly_roots_real (see its own comment).
 #[bounded_stack(bytes = 1048)]
 fn algebra_quartic_roots_real(a: f64, b: f64, c: f64, d: f64, e: f64) -> Vec<f64> {
     let coeffs: Vec<f64> = vec();
@@ -311,6 +339,8 @@ fn algebra_quartic_roots_real(a: f64, b: f64, c: f64, d: f64, e: f64) -> Vec<f64
 // J(x_k)^-1 F(x_k), with the linear solve at each step done by vani-matrix's
 // mat_solve. F returns the length-n residual; J returns the flat n x n
 // Jacobian (row-major). Stops early once ||F(x)||_2 < tol.
+// WCET = 20 + max_iter * (indirect calls to F/J + mat_solve's O(n^3)
+// Gaussian elimination) -- O(max_iter * n^3) overall.
 #[bounded_stack(bytes = 744)]
 fn algebra_newton_system(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n: i64, tol: f64, max_iter: i64) -> Vec<f64> {
     let x: Vec<f64> = _copy_f64(x0);
@@ -336,6 +366,10 @@ fn algebra_newton_system(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) ->
 // finite differences (step h) instead of requiring an analytic J --
 // matching vani-optimize's precedent of offering both an analytic and a
 // finite-difference variant of Newton's method.
+// WCET = 20 + max_iter * (indirect calls to F, an O(n) finite-difference
+// Jacobian loop that itself calls F n times, and mat_solve's O(n^3)) --
+// O(max_iter * n^3) overall, same order as algebra_newton_system but with
+// an extra O(n) factor of F-calls to build the Jacobian.
 #[bounded_stack(bytes = 824)]
 fn algebra_newton_system_fd(F: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n: i64, h: f64, tol: f64, max_iter: i64) -> Vec<f64> {
     let x: Vec<f64> = _copy_f64(x0);
