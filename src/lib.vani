@@ -51,8 +51,8 @@
 //     A polynomial whose remaining factor at some deflation step is
 //     dominated by a complex-conjugate pair will not have that pair
 //     detected -- callers needing complex roots need a different tool.
-use "../vendor/matrix/src/lib.vani";
-use "../vendor/calculus/src/lib.vani";
+// No `use` statement needed: vanic auto-includes every [deps] entry's
+// source before compiling.
 
 // Private helper: vani-calculus's poly_eval/poly_deriv_coeffs/poly_mul take
 // Vec<f64> by value (not ref), consuming their argument -- this copies a
