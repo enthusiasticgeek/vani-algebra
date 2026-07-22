@@ -98,7 +98,7 @@ fn algebra_poly_from_roots(roots: ref Vec<f64>) -> Vec<f64> {
         let factor: Vec<f64> = vec();
         push(mut ref factor, 0.0 - roots[i]);
         push(mut ref factor, 1.0);
-        out = poly_mul(out, factor);
+        out = calculus::poly_mul(out, factor);
         i = i + 1;
     }
     return out;
@@ -129,7 +129,7 @@ fn algebra_poly_normalize_monic(coeffs: ref Vec<f64>) -> Vec<f64> {
 fn algebra_poly_companion(coeffs: ref Vec<f64>) -> Vec<f64> {
     let monic: Vec<f64> = algebra_poly_normalize_monic(coeffs);
     let n: i64 = (len(ref monic) as i64) - 1;
-    let C: Vec<f64> = mat_zeros(n, n);
+    let C: Vec<f64> = matrix::mat_zeros(n, n);
     let i: i64 = 1;
     while i < n {
         set(mut ref C, i * n + (i - 1), 1.0);
@@ -177,10 +177,10 @@ fn algebra_poly_refine_newton(coeffs: ref Vec<f64>, x0: f64, iters: i64) -> f64 
     let i: i64 = 0;
     while i < iters {
         let c1: Vec<f64> = _copy_f64(coeffs);
-        let fx: f64 = poly_eval(c1, x);
+        let fx: f64 = calculus::poly_eval(c1, x);
         let c2: Vec<f64> = _copy_f64(coeffs);
-        let dcoeffs: Vec<f64> = poly_deriv_coeffs(c2);
-        let fpx: f64 = poly_eval(dcoeffs, x);
+        let dcoeffs: Vec<f64> = calculus::poly_deriv_coeffs(c2);
+        let fpx: f64 = calculus::poly_eval(dcoeffs, x);
         if abs(fpx) < 1.0e-300 {
             return x;
         }
@@ -283,7 +283,7 @@ fn algebra_poly_roots_real(coeffs: ref Vec<f64>) -> Vec<f64> {
     let cur_deg: i64 = deg;
     while cur_deg > 3 {
         let C: Vec<f64> = algebra_poly_companion(ref cur);
-        let eig: Vec<f64> = mat_eig_power(ref C, cur_deg, 500, 1.0e-10);
+        let eig: Vec<f64> = matrix::mat_eig_power(ref C, cur_deg, 500, 1.0e-10);
         let r_raw: f64 = eig[0];
         let cur_copy: Vec<f64> = _copy_f64(ref cur);
         let r: f64 = algebra_poly_refine_newton(ref cur_copy, r_raw, 20);
@@ -347,11 +347,11 @@ fn algebra_newton_system(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) ->
     let iter: i64 = 0;
     while iter < max_iter {
         let Fx: Vec<f64> = F(ref x);
-        if vec_norm2(ref Fx, n) < tol {
+        if matrix::vec_norm2(ref Fx, n) < tol {
             return x;
         }
         let Jx: Vec<f64> = J(ref x);
-        let delta: Vec<f64> = mat_solve(ref Jx, ref Fx, n);
+        let delta: Vec<f64> = matrix::mat_solve(ref Jx, ref Fx, n);
         let i: i64 = 0;
         while i < n {
             set(mut ref x, i, x[i] - delta[i]);
@@ -376,10 +376,10 @@ fn algebra_newton_system_fd(F: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n
     let iter: i64 = 0;
     while iter < max_iter {
         let Fx: Vec<f64> = F(ref x);
-        if vec_norm2(ref Fx, n) < tol {
+        if matrix::vec_norm2(ref Fx, n) < tol {
             return x;
         }
-        let J: Vec<f64> = mat_zeros(n, n);
+        let J: Vec<f64> = matrix::mat_zeros(n, n);
         let j: i64 = 0;
         while j < n {
             let xp: Vec<f64> = _copy_f64(ref x);
@@ -392,7 +392,7 @@ fn algebra_newton_system_fd(F: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n
             }
             j = j + 1;
         }
-        let delta: Vec<f64> = mat_solve(ref J, ref Fx, n);
+        let delta: Vec<f64> = matrix::mat_solve(ref J, ref Fx, n);
         let i: i64 = 0;
         while i < n {
             set(mut ref x, i, x[i] - delta[i]);
