@@ -70,14 +70,50 @@
 
 ---
 
+## v0.1.4 (2026-07-27)
+
+- [x] `algebra_newton_system_damped` -- line-search-globalized Newton's
+      method for `F(x) = 0`: the same full Newton step as
+      `algebra_newton_system`, backtracked via an Armijo condition on the
+      merit function `0.5*||F(x)||^2` (same technique as
+      `vani-optimize`'s `armijo_line_search`) instead of always taking the
+      full step. The Newton direction is provably always a descent
+      direction for this merit (`d/dalpha` at `alpha=0` works out to
+      exactly `-||F(x)||^2`, using `J(x).d = -F(x)` from the Newton step
+      itself), so the same backtracking machinery applies directly.
+      Falls back to the smallest step tried if backtracking exhausts
+      `max_ls_iter` without satisfying Armijo, same convention as
+      `armijo_line_search` itself. `#[bounded_stack(bytes = 906)]`,
+      `vanic check`'s exact reported worst-case.
+- [x] `tests/test_newton_system.vani` extended: converges to the same
+      known root from a starting guess (8, 1) far enough that a full
+      undamped step would badly overshoot, with a residual check (not
+      just the expected value). Note: `x0` with `x = -y` exactly makes
+      this system's Jacobian singular (`det J = -2(x+y)`) regardless of
+      solver -- confirmed via scratch testing that even plain
+      `algebra_newton_system` hangs from such a start (`mat_solve` on an
+      exactly-singular matrix), so this is avoided in the test rather
+      than presented as something the damped solver specifically fixes.
+
+**Found but NOT fixed**: `algebra_newton_system_fd` fails to compile on
+the `--backend=c` path -- `cc` reports `'v_xp' undeclared` inside the
+emitted C for its Jacobian finite-difference loop (a `let xp: Vec<f64>`
+declared inside a nested `while`, same shape as `vani-optimize`'s
+`grad_fd`/`hessian_fd`, which compile fine on both backends). Confirmed
+pre-existing via `git stash` against the unmodified file -- unrelated to
+this version's changes, and blocks C-backend compilation of every test
+file in this package (the C backend compiles every function in the
+source file, not just the ones a given test calls). This is a
+vani-compiler backend bug, not a vani-algebra code issue; needs
+investigation in `backend_c.rs`, out of scope for this package's own
+TODO. All testing in this version was done on the LLVM backend only.
+
 ## Future
 
 No v0.2.0 is currently planned. Candidates if a concrete need shows up:
 complex root support (would need a vani-complex dependency and a genuinely
 different companion-matrix eigenvalue method, since `mat_eig_power` cannot
 find complex-conjugate pairs -- QR-algorithm-based eigenvalue extraction
-would be the natural next step in vani-matrix first), a real Ferrari's-
+would be the natural next step in vani-matrix first), and a real Ferrari's-
 method closed form for the quartic (only worth the risk if someone actually
-needs the extra precision/speed over the numeric path), and Broyden's
-method or a line-search globalization for `algebra_newton_system`/`_fd`
-(plain Newton can diverge from a poor initial guess).
+needs the extra precision/speed over the numeric path).

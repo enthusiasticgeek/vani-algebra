@@ -44,5 +44,25 @@ fn main() -> i64 {
     assert abs(residual[0]) < 1.0e-8;
     assert abs(residual[1]) < 1.0e-8;
 
+    // algebra_newton_system_damped, from a starting guess far enough from
+    // the solution that a full undamped Newton step would badly overshoot
+    // (8, 1) -- verified by hand: this still converges to the same root,
+    // and (separately, via scratch testing during development) plain
+    // algebra_newton_system also happens to converge fine from here, so
+    // this checks the damped solver's own correctness rather than
+    // demonstrating a divergence it specifically rescues. Note: x0 with
+    // x = -y exactly makes this system's Jacobian singular (det J =
+    // -2(x+y)) regardless of which solver is used -- not a scenario
+    // either solver is expected to handle, so avoided here.
+    let x0b: Vec<f64> = vec();
+    push(mut ref x0b, 8.0);
+    push(mut ref x0b, 1.0);
+    let sol_damped: Vec<f64> = algebra_newton_system_damped(sys_F, sys_J, ref x0b, 2, 1.0e-10, 50, 30);
+    assert close(sol_damped[0], sqrt(2.0));
+    assert close(sol_damped[1], sqrt(2.0));
+    let residual_damped: Vec<f64> = sys_F(ref sol_damped);
+    assert abs(residual_damped[0]) < 1.0e-8;
+    assert abs(residual_damped[1]) < 1.0e-8;
+
     return 0;
 }

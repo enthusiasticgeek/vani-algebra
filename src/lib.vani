@@ -362,6 +362,75 @@ fn algebra_newton_system(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) ->
     return x;
 }
 
+// Damped (line-search-globalized) Newton's method for F(x) = 0: the same
+// full Newton step as algebra_newton_system, but backtracks the step
+// length via an Armijo condition on the merit function 0.5*||F(x)||^2
+// instead of always taking the full step -- plain Newton can overshoot
+// or diverge entirely from a poor initial guess, the gap this fills.
+// The Newton direction is always a descent direction for this merit: its
+// directional derivative works out to exactly -||F(x)||^2 (standard
+// identity -- d/dalpha[0.5||F(x+alpha*d)||^2] at alpha=0 equals
+// F(x).J(x).d, and J(x).d = -F(x) by construction of the Newton step, so
+// this is F(x).(-F(x)) = -||F(x)||^2), so the same Armijo backtracking
+// vani-optimize's armijo_line_search uses applies directly here with
+// slope = -||F(x)||^2. Falls back to the smallest step tried if
+// backtracking exhausts max_ls_iter without satisfying Armijo, same
+// "always make some progress rather than stalling" convention as
+// armijo_line_search itself.
+// WCET = 20 + max_iter * (F/J calls + mat_solve's O(n^3) + backtracking's
+// own O(max_ls_iter * n) F-evaluations) -- O(max_iter * (n^3 +
+// max_ls_iter * n)).
+#[bounded_stack(bytes = 906)]
+fn algebra_newton_system_damped(F: fn(ref Vec<f64>) -> Vec<f64>, J: fn(ref Vec<f64>) -> Vec<f64>, x0: ref Vec<f64>, n: i64, tol: f64, max_iter: i64, max_ls_iter: i64) -> Vec<f64> {
+    let x: Vec<f64> = _copy_f64(x0);
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let Fx: Vec<f64> = F(ref x);
+        let norm_fx: f64 = matrix::vec_norm2(ref Fx, n);
+        if norm_fx < tol {
+            return x;
+        }
+        let Jx: Vec<f64> = J(ref x);
+        let delta: Vec<f64> = matrix::mat_solve(ref Jx, ref Fx, n);
+        let merit0: f64 = 0.5 * norm_fx * norm_fx;
+        let slope: f64 = 0.0 - norm_fx * norm_fx;
+        let alpha: f64 = 1.0;
+        let ls_iter: i64 = 0;
+        let accepted: bool = false;
+        while ls_iter < max_ls_iter {
+            let xt: Vec<f64> = vec();
+            let i: i64 = 0;
+            while i < n {
+                push(mut ref xt, x[i] - alpha * delta[i]);
+                i = i + 1;
+            }
+            let Fxt: Vec<f64> = F(ref xt);
+            let norm_fxt: f64 = matrix::vec_norm2(ref Fxt, n);
+            let merit_t: f64 = 0.5 * norm_fxt * norm_fxt;
+            if merit_t <= merit0 + 1.0e-4 * alpha * slope {
+                let k: i64 = 0;
+                while k < n {
+                    set(mut ref x, k, xt[k]);
+                    k = k + 1;
+                }
+                accepted = true;
+                break;
+            }
+            alpha = alpha * 0.5;
+            ls_iter = ls_iter + 1;
+        }
+        if !accepted {
+            let k2: i64 = 0;
+            while k2 < n {
+                set(mut ref x, k2, x[k2] - alpha * delta[k2]);
+                k2 = k2 + 1;
+            }
+        }
+        iter = iter + 1;
+    }
+    return x;
+}
+
 // Same as algebra_newton_system but estimates the Jacobian by forward
 // finite differences (step h) instead of requiring an analytic J --
 // matching vani-optimize's precedent of offering both an analytic and a
