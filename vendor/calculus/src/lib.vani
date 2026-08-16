@@ -1,4 +1,4 @@
-// vani-calculus  v0.1.0 — numerical calculus library
+// vani-calculus  v0.3.0 — numerical calculus library
 //
 // IMPORTANT — do NOT reimplement vāṇī compiler builtins.
 // The following are already available as builtins and must be called
@@ -104,6 +104,7 @@ fn integrate_romberg(a: f64, b: f64, ys: ref Vec<f64>, levels: i64) -> f64 {
 // 5-point Gauss-Legendre quadrature on [a, b]; baked-in nodes and weights.
 // WCET = 5 × f_cycles + 100; f_cycles depends on caller's f.
 // bounded_stack = 144 + f's bounded_stack bytes.
+#[wcet(cycles = 152)]
 fn integrate_gauss_legendre_5(a: f64, b: f64, f: fn(f64) -> f64) -> f64 {
     let mid: f64 = (a + b) / 2.0;
     let half: f64 = (b - a) / 2.0;
@@ -583,6 +584,7 @@ fn rk4_solve(y0: f64, ts: ref Vec<f64>, f: fn(f64, f64) -> f64) -> Vec<f64> {
 // Dormand-Prince RK45 step (5th-order solution).
 // WCET = 6 × f_cycles + 120 cycles; f_cycles depends on caller's f.
 // bounded_stack = 120 + f's bounded_stack bytes.
+#[wcet(cycles = 321)]
 fn rk45_step(t: f64, y: f64, h: f64, f: fn(f64, f64) -> f64) -> f64 {
     let k1: f64 = f(t, y);
     let k2: f64 = f(t + h / 5.0,        y + h * k1 / 5.0);
@@ -598,6 +600,282 @@ fn rk45_step(t: f64, y: f64, h: f64, f: fn(f64, f64) -> f64) -> f64 {
 #[wcet(cycles = 64)]
 fn adams_bashforth_2(y_curr: f64, f_prev: f64, f_curr: f64, h: f64) -> f64 {
     return y_curr + h * (3.0 * f_curr - f_prev) / 2.0;
+}
+
+// ── Implicit ODE solvers (v0.3.0) ────────────────────────────────────────────
+//
+// Backward Euler and Crank-Nicolson are both A-stable: unlike the explicit
+// solvers above, they stay bounded on stiff systems (large |df/dy|) even
+// with a step size that would make explicit Euler diverge. Each step
+// solves its implicit equation with Newton's method, using a central-
+// difference estimate of the equation's derivative (same technique this
+// file's own `newton()` uses for root-finding) -- not fixed-point
+// iteration, which would fail to converge on the very stiff problems these
+// solvers exist for (fixed-point iteration on backward Euler is only a
+// contraction for h < 1/|df/dy|, defeating the point of an unconditionally
+// stable method). Each _step function inlines its own Newton loop rather
+// than factoring out a shared g(y)->f64 helper, since vāṇी has no closures
+// and g would need to capture y_curr/h/f/t_next.
+
+// One backward Euler step: solves y_next = y_curr + h*f(t_next, y_next)
+// for y_next via Newton's method (central-difference derivative, step eps).
+#[bounded_stack(bytes = 184)]
+fn backward_euler_step(t_next: f64, y_curr: f64, h: f64, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> f64 {
+    let eps: f64 = 1.0e-6;
+    let y: f64 = y_curr;
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let gy: f64 = y - y_curr - h * f(t_next, y);
+        let gyp: f64 = (y + eps) - y_curr - h * f(t_next, y + eps);
+        let gym: f64 = (y - eps) - y_curr - h * f(t_next, y - eps);
+        let gp: f64 = (gyp - gym) / (2.0 * eps);
+        if abs(gp) < 1.0e-300 {
+            return y;
+        }
+        let y_new: f64 = y - gy / gp;
+        if abs(y_new - y) < tol {
+            return y_new;
+        }
+        y = y_new;
+        iter = iter + 1;
+    }
+    return y;
+}
+
+// Runs backward_euler_step across every interval in ts.
+#[bounded_stack(bytes = 352)]
+fn backward_euler_solve(y0: f64, ts: ref Vec<f64>, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let n: i64 = len(ts) as i64;
+    let result: Vec<f64> = vec(y0);
+    let y: f64 = y0;
+    let i: i64 = 0;
+    while i < n - 1 {
+        let hh: f64 = ts[i + 1] - ts[i];
+        y = backward_euler_step(ts[i + 1], y, hh, f, tol, max_iter);
+        push(mut ref result, y);
+        i = i + 1;
+    }
+    return result;
+}
+
+// One Crank-Nicolson step: solves y_next = y_curr + (h/2)*(f(t_curr,y_curr)
+// + f(t_next,y_next)) for y_next via Newton's method. Second-order accurate
+// (vs. backward Euler's first-order), same unconditional stability.
+#[bounded_stack(bytes = 200)]
+fn crank_nicolson_step(t_curr: f64, y_curr: f64, t_next: f64, h: f64, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> f64 {
+    let eps: f64 = 1.0e-6;
+    let f_curr: f64 = f(t_curr, y_curr);
+    let y: f64 = y_curr;
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let gy: f64 = y - y_curr - (h / 2.0) * (f_curr + f(t_next, y));
+        let gyp: f64 = (y + eps) - y_curr - (h / 2.0) * (f_curr + f(t_next, y + eps));
+        let gym: f64 = (y - eps) - y_curr - (h / 2.0) * (f_curr + f(t_next, y - eps));
+        let gp: f64 = (gyp - gym) / (2.0 * eps);
+        if abs(gp) < 1.0e-300 {
+            return y;
+        }
+        let y_new: f64 = y - gy / gp;
+        if abs(y_new - y) < tol {
+            return y_new;
+        }
+        y = y_new;
+        iter = iter + 1;
+    }
+    return y;
+}
+
+// Runs crank_nicolson_step across every interval in ts.
+#[bounded_stack(bytes = 368)]
+fn crank_nicolson_solve(y0: f64, ts: ref Vec<f64>, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let n: i64 = len(ts) as i64;
+    let result: Vec<f64> = vec(y0);
+    let y: f64 = y0;
+    let i: i64 = 0;
+    while i < n - 1 {
+        let hh: f64 = ts[i + 1] - ts[i];
+        y = crank_nicolson_step(ts[i], y, ts[i + 1], hh, f, tol, max_iter);
+        push(mut ref result, y);
+        i = i + 1;
+    }
+    return result;
+}
+
+// ── BDF2: 2-step backward differentiation formula (v0.3.1) ──────────────────
+//
+// Second-order-accurate implicit method: solves
+//   y_next = (4/3)*y_curr - (1/3)*y_prev + (2h/3)*f(t_next, y_next)
+// for y_next via Newton's method (central-difference derivative, same
+// technique as backward_euler_step/crank_nicolson_step above). Like backward
+// Euler and Crank-Nicolson, BDF2 is stiffly stable and stays bounded on
+// problems that make explicit Euler diverge -- but being a *2-step* method,
+// it needs two prior points (y_prev, y_curr) and can't start from y0 alone.
+// bdf2_solve bootstraps the missing first point with one backward_euler_step
+// (itself A-stable, so it doesn't introduce a stability gap the rest of the
+// run doesn't have) before switching to full BDF2 for every later step.
+//
+// The fixed 4/3, -1/3, 2h/3 coefficients assume a uniform step size. On a
+// `ts` vector with unequal spacing, bdf2_solve still applies them per
+// interval (matching backward_euler_solve/crank_nicolson_solve's own
+// hh = ts[i+1]-ts[i] pattern), which loses second-order accuracy on that
+// interval but stays a stable, convergent approximation -- documented here
+// rather than adding variable-step BDF2's more involved coefficient formula
+// without a concrete need for it.
+
+// One BDF2 step given the two prior points y_curr (most recent) and y_prev.
+#[bounded_stack(bytes = 200)]
+fn bdf2_step(y_curr: f64, y_prev: f64, t_next: f64, h: f64, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> f64 {
+    let eps: f64 = 1.0e-6;
+    let rhs: f64 = (4.0 / 3.0) * y_curr - (1.0 / 3.0) * y_prev;
+    let y: f64 = y_curr;
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let gy: f64 = y - rhs - (2.0 * h / 3.0) * f(t_next, y);
+        let gyp: f64 = (y + eps) - rhs - (2.0 * h / 3.0) * f(t_next, y + eps);
+        let gym: f64 = (y - eps) - rhs - (2.0 * h / 3.0) * f(t_next, y - eps);
+        let gp: f64 = (gyp - gym) / (2.0 * eps);
+        if abs(gp) < 1.0e-300 {
+            return y;
+        }
+        let y_new: f64 = y - gy / gp;
+        if abs(y_new - y) < tol {
+            return y_new;
+        }
+        y = y_new;
+        iter = iter + 1;
+    }
+    return y;
+}
+
+// Runs bdf2_step across every interval in ts, bootstrapping the first step
+// with backward_euler_step since BDF2 itself needs two prior points.
+#[bounded_stack(bytes = 424)]
+fn bdf2_solve(y0: f64, ts: ref Vec<f64>, f: fn(f64, f64) -> f64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let n: i64 = len(ts) as i64;
+    let result: Vec<f64> = vec(y0);
+    if n < 2 {
+        return result;
+    }
+    let h0: f64 = ts[1] - ts[0];
+    let y_prev: f64 = y0;
+    let y_curr: f64 = backward_euler_step(ts[1], y0, h0, f, tol, max_iter);
+    push(mut ref result, y_curr);
+    let i: i64 = 1;
+    while i < n - 1 {
+        let hh: f64 = ts[i + 1] - ts[i];
+        let y_next: f64 = bdf2_step(y_curr, y_prev, ts[i + 1], hh, f, tol, max_iter);
+        push(mut ref result, y_next);
+        y_prev = y_curr;
+        y_curr = y_next;
+        i = i + 1;
+    }
+    return result;
+}
+
+// ── ODE boundary-value problems: shooting method (v0.3.0) ───────────────────
+//
+// Solves y'' = f(t, y, y') on [a,b] with Dirichlet conditions y(a)=ya,
+// y(b)=yb, by converting to the first-order pair y'=v, v'=f(t,y,v) and
+// searching (via secant iteration on the initial slope s=y'(a)) for the
+// slope that makes a forward RK4 integration land on y(b)=yb. The 2-value
+// state [y,v] is threaded through as a Vec<f64> of length 2 rather than
+// two separate f64 outputs, since a function can only return one value.
+
+// One RK4 step for the paired system y'=v, v'=f(t,y,v). Returns [y_new, v_new].
+#[bounded_stack(bytes = 264)]
+#[wcet(cycles = 329)]
+fn bvp_rk4_step(t: f64, y: f64, v: f64, h: f64, f: fn(f64, f64, f64) -> f64) -> Vec<f64> {
+    let k1y: f64 = v;
+    let k1v: f64 = f(t, y, v);
+    let k2y: f64 = v + h / 2.0 * k1v;
+    let k2v: f64 = f(t + h / 2.0, y + h / 2.0 * k1y, v + h / 2.0 * k1v);
+    let k3y: f64 = v + h / 2.0 * k2v;
+    let k3v: f64 = f(t + h / 2.0, y + h / 2.0 * k2y, v + h / 2.0 * k2v);
+    let k4y: f64 = v + h * k3v;
+    let k4v: f64 = f(t + h, y + h * k3y, v + h * k3v);
+    let y_new: f64 = y + (h / 6.0) * (k1y + 2.0 * k2y + 2.0 * k3y + k4y);
+    let v_new: f64 = v + (h / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
+    let out: Vec<f64> = vec();
+    push(mut ref out, y_new);
+    push(mut ref out, v_new);
+    return out;
+}
+
+// Integrates forward from t=a, y=ya, y'=s to t=b using n_steps of
+// bvp_rk4_step. Returns [y(b), y'(b)] only (cheap -- used inside the
+// secant search below); see bvp_shoot_trajectory for the full path.
+#[bounded_stack(bytes = 424)]
+fn bvp_shoot_integrate(a: f64, ya: f64, s: f64, b: f64, n_steps: i64, f: fn(f64, f64, f64) -> f64) -> Vec<f64> {
+    let h: f64 = (b - a) / (n_steps as f64);
+    let y: f64 = ya;
+    let v: f64 = s;
+    let t: f64 = a;
+    let i: i64 = 0;
+    while i < n_steps {
+        let step: Vec<f64> = bvp_rk4_step(t, y, v, h, f);
+        y = step[0];
+        v = step[1];
+        t = t + h;
+        i = i + 1;
+    }
+    let out: Vec<f64> = vec();
+    push(mut ref out, y);
+    push(mut ref out, v);
+    return out;
+}
+
+// Same forward integration as bvp_shoot_integrate, but returns the full
+// y(t) trajectory (n_steps+1 values) instead of just the endpoint.
+#[bounded_stack(bytes = 424)]
+fn bvp_shoot_trajectory(a: f64, ya: f64, s: f64, b: f64, n_steps: i64, f: fn(f64, f64, f64) -> f64) -> Vec<f64> {
+    let h: f64 = (b - a) / (n_steps as f64);
+    let y: f64 = ya;
+    let v: f64 = s;
+    let t: f64 = a;
+    let result: Vec<f64> = vec(y);
+    let i: i64 = 0;
+    while i < n_steps {
+        let step: Vec<f64> = bvp_rk4_step(t, y, v, h, f);
+        y = step[0];
+        v = step[1];
+        t = t + h;
+        push(mut ref result, y);
+        i = i + 1;
+    }
+    return result;
+}
+
+// Solves the two-point BVP by secant search over the initial slope s,
+// starting from guesses s0/s1, until the forward-integrated y(b) is within
+// tol of the target yb. Returns the full y(t) trajectory at the converged
+// slope (n_steps+1 values, matching euler_solve/rk4_solve's convention).
+#[bounded_stack(bytes = 784)]
+fn bvp_shoot_solve(a: f64, b: f64, ya: f64, yb: f64, f: fn(f64, f64, f64) -> f64, s0: f64, s1: f64, n_steps: i64, tol: f64, max_iter: i64) -> Vec<f64> {
+    let sa: f64 = s0;
+    let sb: f64 = s1;
+    let end_a: Vec<f64> = bvp_shoot_integrate(a, ya, sa, b, n_steps, f);
+    let ga: f64 = end_a[0] - yb;
+    let end_b: Vec<f64> = bvp_shoot_integrate(a, ya, sb, b, n_steps, f);
+    let gb: f64 = end_b[0] - yb;
+    let iter: i64 = 0;
+    while iter < max_iter {
+        let denom: f64 = gb - ga;
+        if abs(denom) < 1.0e-15 {
+            return bvp_shoot_trajectory(a, ya, sb, b, n_steps, f);
+        }
+        let sc: f64 = sb - gb * (sb - sa) / denom;
+        let end_c: Vec<f64> = bvp_shoot_integrate(a, ya, sc, b, n_steps, f);
+        let gc: f64 = end_c[0] - yb;
+        if abs(gc) < tol {
+            return bvp_shoot_trajectory(a, ya, sc, b, n_steps, f);
+        }
+        sa = sb;
+        ga = gb;
+        sb = sc;
+        gb = gc;
+        iter = iter + 1;
+    }
+    return bvp_shoot_trajectory(a, ya, sb, b, n_steps, f);
 }
 
 // ── Polynomial arithmetic ─────────────────────────────────────────────────────
