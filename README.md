@@ -8,6 +8,8 @@ Depends on [vani-matrix](https://github.com/enthusiasticgeek/vani-matrix)
 [vani-calculus](https://github.com/enthusiasticgeek/vani-calculus)
 (`poly_eval`, `poly_deriv_coeffs`, `poly_mul`).
 
+**API reference / tutorial:** <https://enthusiasticgeek.github.io/vani-algebra/>
+
 ## Add to your project
 
 ```toml
