@@ -1,0 +1,51 @@
+// Direct test for algebra_poly_companion, which previously had zero
+// test/example coverage of its own (only exercised transitively through
+// algebra_poly_roots_real in test_poly_roots.vani). Checks both the exact
+// matrix layout by hand and that the matrix's dominant eigenvalue (via
+// matrix::mat_eig_power) matches a hand-known polynomial root.
+// Run with:  vanic test tests/test_poly_companion.vani
+
+use "../src/lib.vani";
+
+fn close(a: f64, b: f64) -> bool {
+    return abs(a - b) < 1.0e-6;
+}
+
+fn main() -> i64 {
+    // p(x) = x^2 - 5x + 6 = (x-2)(x-3), already monic, ascending coeffs.
+    let coeffs: Vec<f64> = vec();
+    push(mut ref coeffs, 6.0);
+    push(mut ref coeffs, 0.0 - 5.0);
+    push(mut ref coeffs, 1.0);
+
+    let C: Vec<f64> = algebra_poly_companion(ref coeffs);
+    assert (len(ref C) as i64) == 4; // 2x2, row-major
+
+    // Hand-derived: subdiagonal C[1,0] = 1; last column holds -coeffs.
+    // C = [[0, -6], [1, 5]] flattened row-major -> [0, -6, 1, 5].
+    assert close(C[0], 0.0);
+    assert close(C[1], 0.0 - 6.0);
+    assert close(C[2], 1.0);
+    assert close(C[3], 5.0);
+
+    // Characteristic polynomial of C is lambda^2 - 5*lambda + 6, whose
+    // roots (2, 3) are exactly p's roots -- confirm the dominant eigenvalue
+    // (largest magnitude, here 3.0) via power iteration. mat_eig_power
+    // returns a packed Vec: element 0 is the eigenvalue.
+    let eig: Vec<f64> = matrix::mat_eig_power(ref C, 2, 500, 1.0e-10);
+    assert close(eig[0], 3.0);
+
+    // A non-monic input (2x^2 - 10x + 12, same roots after normalization)
+    // should normalize to the same companion matrix as the monic case.
+    let non_monic: Vec<f64> = vec();
+    push(mut ref non_monic, 12.0);
+    push(mut ref non_monic, 0.0 - 10.0);
+    push(mut ref non_monic, 2.0);
+    let C2: Vec<f64> = algebra_poly_companion(ref non_monic);
+    assert close(C2[0], C[0]);
+    assert close(C2[1], C[1]);
+    assert close(C2[2], C[2]);
+    assert close(C2[3], C[3]);
+
+    return 0;
+}
