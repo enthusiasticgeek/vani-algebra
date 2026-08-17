@@ -1,7 +1,7 @@
 # vani-algebra
 
 Polynomial root-finding and nonlinear equation system library for the
-[vāṇी compiler](https://github.com/enthusiasticgeek/vani-compiler).
+[vāṇī compiler](https://github.com/enthusiasticgeek/vani-compiler).
 
 Depends on [vani-matrix](https://github.com/enthusiasticgeek/vani-matrix)
 (`mat_zeros`, `mat_eig_power`, `mat_solve`) and
@@ -79,7 +79,7 @@ solve, synthetic deflation, and Newton polish together. See `tests/`.
 
 ## What this library does NOT provide
 
-These are already vāṇी compiler builtins — call them directly, no import needed:
+These are already vāṇī compiler builtins — call them directly, no import needed:
 
 `sin` `cos` `sqrt` `abs` `acos` `exp` `f64_pi()` `f64_cbrt`
 `f64_quadratic_root` `push` `pop` `len` `set` `vec`

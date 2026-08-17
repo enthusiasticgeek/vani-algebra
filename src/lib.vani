@@ -1,6 +1,6 @@
 // vani-algebra  v0.1.0 — polynomial root-finding and nonlinear equation systems
 //
-// IMPORTANT — do NOT reimplement vāṇी compiler builtins.
+// IMPORTANT — do NOT reimplement vāṇī compiler builtins.
 // Already available as builtins (call directly, never redeclare here):
 //   sin cos sqrt abs acos exp  f64_pi()  f64_cbrt  f64_quadratic_root
 //   push pop len set vec
